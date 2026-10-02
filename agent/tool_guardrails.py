@@ -79,6 +79,17 @@ _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
 # Per-turn caps on runaway-prone tools (counters reset in reset_for_turn).
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+_DEFAULT_MAX_TOTAL_CALLS_PER_TURN = 80
+
+# Trivial control/metadata tools carrying ~zero persisted payload. Counting them toward the
+# per-turn total-call volume cap made the cap fire on calls like todo_list during long,
+# legitimate agentic turns. Excluding them keeps the cap aimed at cache-prefix growth (large
+# reads/execs/writes) instead of bookkeeping calls.
+_VOLUME_CAP_EXEMPT_TOOLS = frozenset({
+    "todo_list", "skills_list", "skill_view", "session_search",
+    "fact_store", "fact_feedback", "memory", "clarify",
+    "cronjob_manage", "process_manage",
+})
 
 # Interactive surfaces plus bounded supervised task loops (subagent stopped by its parent;
 # api_server has a live client) doing real edit -> re-run work keep the warn-only default.
@@ -99,11 +110,13 @@ def _is_non_interactive_platform(platform: str | None) -> bool:
 
 @dataclass(frozen=True)
 class LoopCapConfig:
-    """Per-turn hard ceilings on web_search calls / subagent spawns; count total calls (not
-    repeats), fire regardless of ``hard_stop_enabled``; ``0`` disables a cap."""
+    """Per-turn hard ceilings on web_search calls / subagent spawns / TOTAL payload-bearing tool
+    calls; counts total calls (not repeats), fires regardless of ``hard_stop_enabled``; ``0``
+    disables a cap. ``max_total_calls`` is the volume guard and ignores exempt bookkeeping tools."""
 
     max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+    max_total_calls: int = _DEFAULT_MAX_TOTAL_CALLS_PER_TURN
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
@@ -281,6 +294,11 @@ _DECISION_MESSAGES: dict[str, str] = {
         "Blocked delegate_task: this turn has already spawned {count} subagents (limit {cap}). "
         "This looks like a runaway delegation loop. Finish the work with the results you have and answer the user."
     ),
+    "loop_total_calls_cap": (
+        "Blocked {tool_name}: this turn has already made {count} payload-bearing tool calls "
+        "(per-turn limit {cap}). Stop adding more calls; consolidate with what you already have "
+        "and answer the user."
+    ),
 }
 
 _IDENTICAL_CALL_NOTICE = (
@@ -337,6 +355,7 @@ class ToolCallGuardrailController:
         self._persisted_result_paths: dict[str, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._turn_total_call_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -361,8 +380,9 @@ class ToolCallGuardrailController:
 
         # Loop caps apply regardless of hard_stop_enabled (which only governs the detector).
         cap_block = self._check_loop_cap(tool_name, args, signature)
-        if cap_block is not None or not self.config.hard_stop_enabled:
-            return cap_block or allow
+        total_block = self._check_total_call_cap(tool_name, signature)
+        if cap_block is not None or total_block is not None or not self.config.hard_stop_enabled:
+            return cap_block or total_block or allow
         # A mutation since this call last failed makes the retry a new experiment.
         exact_count = 0 if self._progress_since_failure.get(signature) else self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
@@ -558,6 +578,21 @@ class ToolCallGuardrailController:
         if increment and cap and count >= cap:
             return self._decide("block", code, tool_name, count, signature, cap=cap)
         setattr(self, count_attr, count + increment)
+        return None
+
+    def _check_total_call_cap(self, tool_name: str, signature: ToolCallSignature) -> ToolGuardrailDecision | None:
+        """Block once the per-turn TOTAL payload-bearing call volume reaches ``max_total_calls``
+        (BEFORE the call, so the (cap+1)-th is refused), else advance the counter and return None.
+        Tools in ``_VOLUME_CAP_EXEMPT_TOOLS`` never count and never trigger: they carry ~zero
+        persisted payload, so counting them made the cap fire on bookkeeping during long,
+        legitimate turns instead of on cache-prefix growth."""
+        if tool_name in _VOLUME_CAP_EXEMPT_TOOLS:
+            return None
+        cap = self.config.loop_caps.max_total_calls
+        count = self._turn_total_call_count
+        if cap and count >= cap:
+            return self._decide("block", "loop_total_calls_cap", tool_name, count, signature, cap=cap)
+        self._turn_total_call_count = count + 1
         return None
 
 

@@ -15,6 +15,16 @@ from hermes_state_common import FTS_STORAGE_VERSION
 from hermes_state_holders import read_only_db_uri
 
 
+def _honcho_is_configured_for_doctor() -> bool:
+    """Return True when Honcho is configured, even if this process has no active session."""
+    try:
+        from plugins.memory import import_provider_module
+        cfg = import_provider_module("honcho", "client").HonchoClientConfig.from_global_config()
+        return bool(cfg.enabled and (cfg.api_key or cfg.base_url))
+    except Exception:
+        return False
+
+
 def _doctor_memory_config(hermes_home: Path | None = None) -> dict:
     """Return the effective memory section used by doctor diagnostics."""
     from hermes_cli.doctor import HERMES_HOME
@@ -96,7 +106,20 @@ def _render_state_db_stats(stats: dict, holders=None, host_note: str = "") -> li
     # Oversized DB: suggest auto_prune, plus the offline optimize-storage pass when the FTS rebuild is
     # pending OR the DB predates the current trigram layout (fts_storage_version < FTS_STORAGE_VERSION).
     if logical is not None and logical > STATE_DB_SIZE_WARN_BYTES:
-        detail = "consider enabling sessions.auto_prune in config.yaml to bound growth"
+        # Customization (2026-09-27): never suggest enabling auto_prune when it is already enabled —
+        # a stale suggestion makes the operator chase a config that is already correct while the real
+        # weight (reasoning columns + FTS of sessions inside the retention window) is legitimate content.
+        try:
+            from hermes_cli.config import load_config as _load_cfg_for_prune_check
+            _prune_on = bool((_load_cfg_for_prune_check().get("sessions") or {}).get("auto_prune", False))
+        except Exception:
+            _prune_on = False
+        if _prune_on:
+            detail = ("sessions.auto_prune already enabled; remaining size is content inside the "
+                      "retention window (reasoning + FTS) — run 'hermes sessions optimize-storage' "
+                      "offline to compact, or lower sessions.retention_days to bound it further")
+        else:
+            detail = "consider enabling sessions.auto_prune in config.yaml to bound growth"
         stale_trigram = (fts is not None and fts.get("messages_fts_trigram")
                          and (stats.get("fts_storage_version") or 0) < FTS_STORAGE_VERSION)
         if stats.get("fts_rebuild_pending") or stale_trigram:
@@ -399,6 +422,25 @@ def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: st
         _repair_state_db(f, should_fix, state_db_path, "fts")
 
 
+def _state_db_issue_text(detail: str) -> str | None:
+    """Map a large-DB warn detail to its action-item text (or None).
+
+    The detail already distinguishes ``sessions.auto_prune already enabled``
+    (auto_prune on, size is legitimate in-window content) from ``consider
+    enabling sessions.auto_prune`` (auto_prune off). The issue must mirror that
+    truth — suggesting "enable auto_prune" when it is already on is a stale
+    config chase that ``hermes doctor --fix`` can never resolve.
+    """
+    if "already enabled" in detail:
+        return ("state.db is large — sessions.auto_prune already enabled; "
+                "run 'hermes sessions optimize-storage' offline (gateway stopped) "
+                "to compact, or lower sessions.retention_days to bound it further")
+    if "auto_prune" in detail:
+        return ("state.db is large — enable sessions.auto_prune in config.yaml"
+                + (" and run 'hermes sessions optimize-storage' offline (gateway stopped)" if "optimize-storage" in detail else ""))
+    return None
+
+
 def _state_db_stats(issues: list, state_db_path: Path) -> None:
     """Health/stats snapshot: strictly read-only (mode=ro) so it is safe against a live DB held by
     the gateway; any failure degrades to one info line rather than failing doctor."""
@@ -411,9 +453,9 @@ def _state_db_stats(issues: list, state_db_path: Path) -> None:
                 check_info(_text + (f" {_detail}" if _detail else ""))
                 continue
             check_warn(_text, _detail)
-            if "auto_prune" in _detail:
-                issues.append("state.db is large — enable sessions.auto_prune in config.yaml"
-                              + (" and run 'hermes sessions optimize-storage' offline (gateway stopped)" if "optimize-storage" in _detail else ""))
+            _issue = _state_db_issue_text(_detail)
+            if _issue is not None:
+                issues.append(_issue)
 
 
 def _state_db_wal(f: Finding, should_fix: bool, state_db_path: Path) -> None:
@@ -579,6 +621,30 @@ def _check_skills_hub(should_fix: bool, f: Finding) -> None:
                    ("No GITHUB_TOKEN", f"(60 req/hr rate limit — set in {_DHH}/.env for better rates)"))
 
 
+def _memory_provider_honcho(issues: list) -> None:
+    from plugins.memory import import_provider_module
+    client = import_provider_module("honcho", "client")
+    hcfg = client.HonchoClientConfig.from_global_config()
+    cfg_path = client.resolve_config_path()
+    if not cfg_path.exists():
+        # Config file missing — env-var fallback may still have resolved it.
+        check_bool(hcfg.api_key or hcfg.base_url,
+                   ("Honcho configured via environment variables", f"config file {cfg_path} not found, using HONCHO_API_KEY env var"),
+                   ("Honcho config not found", "run: hermes memory setup"))
+    elif not hcfg.enabled:
+        check_info(f"Honcho disabled (set enabled: true in {cfg_path} to activate)")
+    elif not (hcfg.api_key or hcfg.base_url):
+        _fail_and_issue("Honcho API key or base URL not set", "run: hermes memory setup",
+                        "No Honcho API key — run 'hermes memory setup'", issues)
+    else:
+        client.reset_honcho_client()
+        try:
+            client.get_honcho_client(hcfg)
+            check_ok("Honcho connected", f"workspace={hcfg.workspace_id} mode={hcfg.recall_mode} freq={hcfg.write_frequency}")
+        except Exception as _e:
+            _fail_and_issue("Honcho connection failed", str(_e), f"Honcho unreachable: {_e}", issues)
+
+
 def _memory_provider_mem0(issues: list) -> None:
     from plugins.memory import import_provider_module
     mem0_cfg = import_provider_module("mem0")._load_config()
@@ -592,13 +658,15 @@ def _memory_provider_mem0(issues: list) -> None:
 
 # provider -> (checker, ImportError row, ImportError issue, label for "check failed")
 _MEMORY_PROVIDER_CHECKS = {
+    "honcho": (_memory_provider_honcho, ("honcho-ai not installed", "run hermes memory setup"),
+               "Honcho dependencies missing — run hermes memory setup, then restart Hermes", "Honcho"),
     "mem0": (_memory_provider_mem0, ("Mem0 plugin not loadable", "run hermes memory setup"),
              "Mem0 dependencies missing — run hermes memory setup, then restart Hermes", "Mem0"),
 }
 
 
 def _memory_provider_generic(name: str) -> None:
-    """Generic check for every other memory provider (openviking, honcho, hindsight, ...)."""
+    """Generic check for other memory providers (openviking, hindsight, etc.)."""
     from plugins.memory import load_memory_provider
     _provider = load_memory_provider(name)
     if _provider and _provider.is_available():
@@ -606,10 +674,7 @@ def _memory_provider_generic(name: str) -> None:
     elif _provider:
         check_warn(f"{name} configured but not available", "run: hermes memory status")
     else:
-        from plugins.memory import find_provider_dir
-        from hermes_cli.memory_provider_migration import catalog_install_hint
-        hint = catalog_install_hint(name, category="memory") if find_provider_dir(name) is None else None
-        check_warn(f"{name} plugin not found", f"run: {hint or 'hermes memory setup'}")
+        check_warn(f"{name} plugin not found", "run: hermes memory setup")
 
 
 @doctor_check()
