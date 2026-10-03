@@ -60,6 +60,14 @@ OPENROUTER_ENDPOINT_PINS: dict[str, tuple[str, tuple[str, ...]]] = {
 class OpenRouterProfile(ProviderProfile):
     """OpenRouter aggregator — provider preferences, reasoning config passthrough."""
 
+    def default_vision_model(self) -> str | None:
+        """Canonical OpenRouter vision default (multimodal, cheap, 1M ctx).
+
+        OpenRouter lists 237 vision-capable routes; pin the verified Qwen omni-flash
+        instead of guessing. ``auxiliary.vision.model`` overrides this.
+        """
+        return "qwen/qwen3.8-omni-flash"
+
     @staticmethod
     def _clamp_reasoning_to_catalog(cfg: dict[str, Any], model: str | None) -> dict[str, Any] | None:
         """Clamp ``cfg["effort"]`` to the model's catalog-advertised levels.

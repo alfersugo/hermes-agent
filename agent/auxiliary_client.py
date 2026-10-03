@@ -5591,7 +5591,10 @@ def _vision_main_provider_client(
     # A provider vision default (static override or catalog discovery) is a *known* multimodal
     # model; the pinned chat model usually isn't, so only fall back to it when no default exists.
     provider_vision_default = _resolve_provider_vision_default(main_provider)
-    vision_model = provider_vision_default or main_model
+    # Prefer the explicitly configured auxiliary.vision.model before the text-only chat model:
+    # an unset provider default would otherwise pair a vision task with the user's text model
+    # (e.g. deepseek-v4-pro on openrouter), fail the vision check, and route to Nous.
+    vision_model = provider_vision_default or resolved_model or main_model
     if main_provider == "nous":
         # Nous picks its vision model from Portal tier-aware slots inside _try_nous(vision=True);
         # passing the chat model would override that and 404. Only auxiliary.vision.model may.
