@@ -58,6 +58,7 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "youtube": "youtube_transcript_api",
     "acp": "acp",
     "web": "fastapi",
+    "proxy": "aiohttp",
     "doc-extract": "anydoc",
     "documents": ("docx", "openpyxl", "pptx", "reportlab", "pypdf"),
     "documents-pdf": ("pdfplumber", "pypdfium2"),

@@ -97,7 +97,20 @@ def _render_state_db_stats(stats: dict, holders=None, host_note: str = "") -> li
     # pending, an earlier run stopped before tearing down the old index, or the stored FTS layout is an
     # older release's (not just a lagging marker).
     if logical is not None and logical > STATE_DB_SIZE_WARN_BYTES:
-        detail = "consider enabling sessions.auto_prune in config.yaml to bound growth"
+        # Customization (2026-09-27): never suggest enabling auto_prune when it is already enabled —
+        # a stale suggestion makes the operator chase a config that is already correct while the real
+        # weight (reasoning columns + FTS of sessions inside the retention window) is legitimate content.
+        try:
+            from hermes_cli.config import load_config as _load_cfg_for_prune_check
+            _prune_on = bool((_load_cfg_for_prune_check().get("sessions") or {}).get("auto_prune", False))
+        except Exception:
+            _prune_on = False
+        if _prune_on:
+            detail = ("sessions.auto_prune already enabled; remaining size is content inside the "
+                      "retention window (reasoning + FTS) — run 'hermes sessions optimize-storage' "
+                      "offline to compact, or lower sessions.retention_days to bound it further")
+        else:
+            detail = "consider enabling sessions.auto_prune in config.yaml to bound growth"
         structural_fts_upgrade = bool(stats.get("fts_storage_upgrade_needed"))
         if stats.get("fts_rebuild_pending") or stats.get("fts_teardown_pending") or structural_fts_upgrade:
             detail += "; run 'hermes sessions optimize-storage' offline (with the host gateway stopped) to compact FTS storage"
@@ -407,6 +420,25 @@ def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: st
         _repair_state_db(f, should_fix, state_db_path, "fts")
 
 
+def _state_db_issue_text(detail: str) -> str | None:
+    """Map a large-DB warn detail to its action-item text (or None).
+
+    The detail already distinguishes ``sessions.auto_prune already enabled``
+    (auto_prune on, size is legitimate in-window content) from ``consider
+    enabling sessions.auto_prune`` (auto_prune off). The issue must mirror that
+    truth — suggesting "enable auto_prune" when it is already on is a stale
+    config chase that ``hermes doctor --fix`` can never resolve.
+    """
+    if "already enabled" in detail:
+        return ("state.db is large — sessions.auto_prune already enabled; "
+                "run 'hermes sessions optimize-storage' offline (gateway stopped) "
+                "to compact, or lower sessions.retention_days to bound it further")
+    if "auto_prune" in detail:
+        return ("state.db is large — enable sessions.auto_prune in config.yaml"
+                + (" and run 'hermes sessions optimize-storage' offline (gateway stopped)" if "optimize-storage" in detail else ""))
+    return None
+
+
 def _state_db_stats(issues: list, state_db_path: Path) -> None:
     """Health/stats snapshot: strictly read-only (mode=ro) so it is safe against a live DB held by
     the gateway; any failure degrades to one info line rather than failing doctor."""
@@ -419,9 +451,9 @@ def _state_db_stats(issues: list, state_db_path: Path) -> None:
                 check_info(_text + (f" {_detail}" if _detail else ""))
                 continue
             check_warn(_text, _detail)
-            if "auto_prune" in _detail:
-                issues.append("state.db is large — enable sessions.auto_prune in config.yaml"
-                              + (" and run 'hermes sessions optimize-storage' offline (gateway stopped)" if "optimize-storage" in _detail else ""))
+            _issue = _state_db_issue_text(_detail)
+            if _issue is not None:
+                issues.append(_issue)
 
 
 def _state_db_wal(f: Finding, should_fix: bool, state_db_path: Path) -> None:

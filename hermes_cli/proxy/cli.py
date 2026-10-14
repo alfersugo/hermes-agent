@@ -19,11 +19,39 @@ def _err(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _ensure_proxy_runtime() -> None:
+    """Make aiohttp importable before starting the proxy.
+
+    aiohttp is an extras install kept off the common path; ``hermes proxy`` is
+    the only caller that needs it. Lazily install the ``proxy`` extra on first
+    use, then reload the server module so its module-level ``AIOHTTP_AVAILABLE``
+    flag (and the ``aiohttp``/``web`` globals) reflect the installed state.
+    """
+    if AIOHTTP_AVAILABLE:
+        return
+    try:
+        from pm import ensure_import
+
+        ensure_import("proxy")
+    except Exception as exc:
+        _err(
+            f"hermes proxy requires aiohttp ({exc}). "
+            f"Run `hermes pm install --extra proxy` to install it."
+        )
+        raise SystemExit(1)
+    import importlib
+
+    from hermes_cli.proxy import server as _server
+
+    importlib.reload(_server)
+    if not _server.AIOHTTP_AVAILABLE:
+        _err("hermes proxy requires aiohttp. Run `hermes pm install --extra proxy` and restart.")
+        raise SystemExit(1)
+
+
 def cmd_proxy_start(args: Any) -> int:
     """Run the proxy server in the foreground."""
-    if not AIOHTTP_AVAILABLE:
-        _err("hermes proxy requires aiohttp. Run `hermes setup` to install it.")
-        return 1
+    _ensure_proxy_runtime()
     provider = getattr(args, "provider", None) or "nous"
     try:
         adapter = get_adapter(provider)

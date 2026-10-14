@@ -434,6 +434,11 @@ mcp = [
 # Backwards-compatible no-op alias. Relay is a core dependency on supported
 # wheel targets and intentionally unavailable on other platforms.
 nemo-relay = []
+# `hermes proxy` (local OpenAI-compatible credential-attaching forwarder) is a
+# core CLI feature whose only optional dependency is aiohttp. It stays a lazy
+# extra (pm.ensure_import("proxy")) so aiohttp keeps off the common path and
+# a quarantined aiohttp release cannot break a fresh install.
+proxy = ["aiohttp==3.14.5"]
 sms = ["aiohttp==3.14.5"]
 teams = [
   "microsoft-teams-apps==2.1.1",

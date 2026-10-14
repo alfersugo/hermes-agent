@@ -557,6 +557,7 @@ DEFAULT_CONFIG = {
         "loop_caps": {
             "max_web_searches": 50,   # web_search calls per turn
             "max_subagents": 50,      # subagents spawned per turn
+            "max_total_calls": 80,    # TOTAL payload-bearing tool calls per turn (volume guard)
         },
     },
 
