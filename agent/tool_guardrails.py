@@ -441,7 +441,7 @@ class ToolCallGuardrailController:
             if warnings and same_count >= self.config.same_tool_failure_warn_after:
                 return self._decide(
                     "warn", "same_tool_failure_warning", tool_name, same_count, signature,
-                    message=_tool_failure_recovery_hint(tool_name, same_count),
+                    message=_tool_failure_recovery_hint(tool_name, same_count, result),
                 )
             return ToolGuardrailDecision(tool_name=tool_name, count=exact_count, signature=signature)
 
@@ -621,13 +621,46 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
     return (result or "") + f"\n\n[{label}: {decision.code}; count={decision.count}; {decision.message}]"
 
 
-def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
+# Result markers that indicate the tool call was REJECTED for a malformed parameter
+# NAME (model JSON serialization corrupted a schema key — stray _v2/_x/_hint suffixes,
+# trailing spaces, or a dropped required key), as opposed to a real tool failure. This
+# is the dominant recurrent block signature in the ledger (same_tool_failure, ~10 events);
+# a specific recovery hint short-circuits the retry loop before the hard stop.
+_PARAM_ERROR_MARKERS = (
+    "required argument",
+    "missing required",
+    "valid parameters",
+    "unexpected keyword",
+    "validation error",
+    "invalid parameter",
+    "pydantic_core",
+    "1 validation error",
+)
+
+
+def _looks_like_parameter_error(result: str | None) -> bool:
+    """True when a tool result is a schema/argument-validation rejection rather than a real failure."""
+    if not isinstance(result, str) or not result:
+        return False
+    lowered = result.lower()
+    return any(marker in lowered for marker in _PARAM_ERROR_MARKERS)
+
+
+def _tool_failure_recovery_hint(tool_name: str, count: int, result: str | None = None) -> str:
     """Action-oriented guidance for recovering from repeated tool failures."""
     common = (
         f"{tool_name} has failed {count} times this turn. This looks like a loop. "
         "Do not switch to text-only replies; keep using tools, but diagnose before retrying. "
         "First inspect the latest error/output and verify your assumptions. "
     )
+    if _looks_like_parameter_error(result):
+        return common + (
+            "This tool is rejecting the call because a PARAMETER NAME is missing or malformed "
+            "(the model serialized a schema key wrong — e.g. a stray suffix like _v2/_x/_hint, "
+            "a trailing space, or a dropped required key). Read the error's list of valid "
+            "parameters and resend with the EXACT schema key names VERBATIM; never retry the "
+            "same malformed JSON unchanged."
+        )
     if tool_name == "terminal":
         return common + (
             "For terminal failures, run a small diagnostic such as `pwd && ls -la` "

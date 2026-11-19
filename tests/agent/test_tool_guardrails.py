@@ -8,9 +8,37 @@ from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
+    _looks_like_parameter_error,
+    _tool_failure_recovery_hint,
     canonical_tool_args,
     classify_tool_failure,
 )
+
+
+def test_param_error_recovery_hint_is_specific_for_schema_rejections():
+    # A malformed parameter NAME (model JSON serialization) must get a specific hint
+    # naming the PARAMETER, not the generic "change arguments" guidance.
+    specific = _tool_failure_recovery_hint("fact_store", 3, "Missing required argument: 'content'")
+    assert "PARAMETER NAME" in specific
+    generic = _tool_failure_recovery_hint("web_search", 3, "HTTP 500 internal error")
+    assert "PARAMETER NAME" not in generic
+
+
+@pytest.mark.parametrize(
+    "result, expected",
+    [
+        ("Missing required argument: 'content'", True),
+        ("1 validation error for Function", True),
+        ("see 'valid parameters' below", True),
+        ("unexpected keyword argument 'summaryetata'", True),
+        ("exit_code 1: command not found", False),
+        ("HTTP 500 internal server error", False),
+        (None, False),
+        ("", False),
+    ],
+)
+def test_looks_like_parameter_error(result, expected):
+    assert _looks_like_parameter_error(result) is expected
 
 
 def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
